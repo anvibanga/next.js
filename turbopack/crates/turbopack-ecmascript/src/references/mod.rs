@@ -1156,20 +1156,19 @@ pub(crate) async fn analyse_ecmascript_module_internal(
                         .link_value(*func, eval_context.imports.get_attributes(span))
                         .await?;
 
-                    add_effects(
-                        handle_call(
-                            &ast_path,
-                            span,
-                            func,
-                            JsValue::unknown_empty(false, "no this provided"),
-                            args,
-                            &analysis_state,
-                            &mut analysis,
-                            in_try,
-                            new,
-                        )
-                        .await?,
-                    );
+                    handle_call(
+                        &ast_path,
+                        span,
+                        func,
+                        JsValue::unknown_empty(false, "no this provided"),
+                        args,
+                        &analysis_state,
+                        &add_effects,
+                        &mut analysis,
+                        in_try,
+                        new,
+                    )
+                    .await?;
                 }
                 Effect::MemberCall {
                     obj,
@@ -1234,20 +1233,19 @@ pub(crate) async fn analyse_ecmascript_module_internal(
                         )
                         .await?;
 
-                    add_effects(
-                        handle_call(
-                            &ast_path,
-                            span,
-                            func,
-                            obj,
-                            args,
-                            &analysis_state,
-                            &mut analysis,
-                            in_try,
-                            new,
-                        )
-                        .await?,
-                    );
+                    handle_call(
+                        &ast_path,
+                        span,
+                        func,
+                        obj,
+                        args,
+                        &analysis_state,
+                        &add_effects,
+                        &mut analysis,
+                        in_try,
+                        new,
+                    )
+                    .await?;
                 }
                 Effect::FreeVar {
                     var,
@@ -1430,17 +1428,18 @@ async fn compile_time_info_for_module_type(
     .cell())
 }
 
-async fn handle_call(
+async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
     ast_path: &[AstParentKind],
     span: Span,
     func: JsValue,
     this: JsValue,
     args: Vec<EffectArg>,
     state: &AnalysisState<'_>,
+    add_effects: &G,
     analysis: &mut AnalyzeEcmascriptModuleResultBuilder,
     in_try: bool,
     new: bool,
-) -> Result<Vec<Effect>> {
+) -> Result<()> {
     let &AnalysisState {
         handler,
         origin,
@@ -1453,19 +1452,26 @@ async fn handle_call(
     fn explain_args(args: &[JsValue]) -> (String, String) {
         JsValue::explain_args(args, 10, 2)
     }
-    let mut effects = vec![];
-    let mut linked_args = |args: Vec<EffectArg>| {
+    let linked_args = |args: Vec<EffectArg>| async move {
         args.into_iter()
-            .map(|arg| match arg {
-                EffectArg::Value(value) => value,
-                EffectArg::Closure(value, block) => {
-                    effects.extend(block.effects);
-                    value
+            .map(|arg| {
+                let add_effects = &add_effects;
+                async move {
+                    let value = match arg {
+                        EffectArg::Value(value) => value,
+                        EffectArg::Closure(value, block) => {
+                            add_effects(block.effects);
+                            value
+                        }
+                        EffectArg::Spread => {
+                            JsValue::unknown_empty(true, "spread is not supported yet")
+                        }
+                    };
+                    state.link_value(value, ImportAttributes::empty_ref()).await
                 }
-                EffectArg::Spread => JsValue::unknown_empty(true, "spread is not supported yet"),
             })
-            .map(|value| state.link_value(value, ImportAttributes::empty_ref()))
             .try_join()
+            .await
     };
 
     if new {
@@ -1491,7 +1497,7 @@ async fn handle_call(
                                 ),
                             );
                             if ignore_dynamic_requests {
-                                return Ok(effects);
+                                return Ok(());
                             }
                         }
                         analysis.add_reference(
@@ -1511,7 +1517,7 @@ async fn handle_call(
                         );
                     }
                 }
-                return Ok(effects);
+                return Ok(());
             }
             JsValue::WellKnownFunction(WellKnownFunctionKind::WorkerConstructor) => {
                 let args = linked_args(args).await?;
@@ -1527,7 +1533,7 @@ async fn handle_call(
                             ),
                         );
                         if ignore_dynamic_requests {
-                            return Ok(effects);
+                            return Ok(());
                         }
                     }
 
@@ -1545,7 +1551,7 @@ async fn handle_call(
                         );
                     }
 
-                    return Ok(effects);
+                    return Ok(());
                 }
                 let (args, hints) = explain_args(&args);
                 handler.span_warn_with_code(
@@ -1555,17 +1561,17 @@ async fn handle_call(
                         errors::failed_to_analyse::ecmascript::DYNAMIC_IMPORT.to_string(),
                     ),
                 );
-                return Ok(effects);
+                return Ok(());
             }
             _ => {}
         }
 
         for arg in args {
             if let EffectArg::Closure(_, block) = arg {
-                effects.extend(block.effects);
+                add_effects(block.effects);
             }
         }
-        return Ok(effects);
+        return Ok(());
     }
 
     match func {
@@ -1575,20 +1581,19 @@ async fn handle_call(
             logical_property: _,
         } => {
             for alt in values {
-                effects.extend(
-                    Box::pin(handle_call(
-                        ast_path,
-                        span,
-                        alt,
-                        this.clone(),
-                        args.clone(),
-                        state,
-                        analysis,
-                        in_try,
-                        new,
-                    ))
-                    .await?,
-                );
+                Box::pin(handle_call(
+                    ast_path,
+                    span,
+                    alt,
+                    this.clone(),
+                    args.clone(),
+                    state,
+                    add_effects,
+                    analysis,
+                    in_try,
+                    new,
+                ))
+                .await?;
             }
         }
         JsValue::WellKnownFunction(WellKnownFunctionKind::Import) => {
@@ -1630,7 +1635,7 @@ async fn handle_call(
                         analysis.add_code_gen(DynamicExpression::new_promise(Vc::cell(
                             ast_path.to_vec(),
                         )));
-                        return Ok(effects);
+                        return Ok(());
                     }
                 }
                 analysis.add_reference(
@@ -1646,7 +1651,7 @@ async fn handle_call(
                     .to_resolved()
                     .await?,
                 );
-                return Ok(effects);
+                return Ok(());
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -1672,7 +1677,7 @@ async fn handle_call(
                     );
                     if ignore_dynamic_requests {
                         analysis.add_code_gen(DynamicExpression::new(Vc::cell(ast_path.to_vec())));
-                        return Ok(effects);
+                        return Ok(());
                     }
                 }
                 analysis.add_reference(
@@ -1686,7 +1691,7 @@ async fn handle_call(
                     .to_resolved()
                     .await?,
                 );
-                return Ok(effects);
+                return Ok(());
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -1726,7 +1731,7 @@ async fn handle_call(
                     );
                     if ignore_dynamic_requests {
                         analysis.add_code_gen(DynamicExpression::new(Vc::cell(ast_path.to_vec())));
-                        return Ok(effects);
+                        return Ok(());
                     }
                 }
                 analysis.add_reference(
@@ -1740,7 +1745,7 @@ async fn handle_call(
                     .to_resolved()
                     .await?,
                 );
-                return Ok(effects);
+                return Ok(());
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -1768,7 +1773,7 @@ async fn handle_call(
                             errors::failed_to_analyse::ecmascript::REQUIRE_CONTEXT.to_string(),
                         ),
                     );
-                    return Ok(effects);
+                    return Ok(());
                 }
             };
 
@@ -1802,7 +1807,7 @@ async fn handle_call(
                         ),
                     );
                     if ignore_dynamic_requests {
-                        return Ok(effects);
+                        return Ok(());
                     }
                 }
                 analysis.add_reference(
@@ -1810,7 +1815,7 @@ async fn handle_call(
                         .to_resolved()
                         .await?,
                 );
-                return Ok(effects);
+                return Ok(());
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -1849,7 +1854,7 @@ async fn handle_call(
                     ),
                 );
                 if ignore_dynamic_requests {
-                    return Ok(effects);
+                    return Ok(());
                 }
             }
             analysis.add_reference(
@@ -1857,14 +1862,14 @@ async fn handle_call(
                     .to_resolved()
                     .await?,
             );
-            return Ok(effects);
+            return Ok(());
         }
 
         JsValue::WellKnownFunction(WellKnownFunctionKind::PathJoin) => {
             let context_path = source.ident().path().await?;
             // ignore path.join in `node-gyp`, it will includes too many files
             if context_path.path.contains("node_modules/node-gyp") {
-                return Ok(effects);
+                return Ok(());
             }
             let args = linked_args(args).await?;
             let linked_func_call = state
@@ -1887,7 +1892,7 @@ async fn handle_call(
                     ),
                 );
                 if ignore_dynamic_requests {
-                    return Ok(effects);
+                    return Ok(());
                 }
             }
             analysis.add_reference(
@@ -1895,14 +1900,14 @@ async fn handle_call(
                     .to_resolved()
                     .await?,
             );
-            return Ok(effects);
+            return Ok(());
         }
         JsValue::WellKnownFunction(WellKnownFunctionKind::ChildProcessSpawnMethod(name)) => {
             let args = linked_args(args).await?;
 
             // Is this specifically `spawn(process.argv[0], ['-e', ...])`?
             if is_invoking_node_process_eval(&args) {
-                return Ok(effects);
+                return Ok(());
             }
 
             if !args.is_empty() {
@@ -1953,7 +1958,7 @@ async fn handle_call(
                         ),
                     );
                 }
-                return Ok(effects);
+                return Ok(());
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -1979,7 +1984,7 @@ async fn handle_call(
                         ),
                     );
                     if ignore_dynamic_requests {
-                        return Ok(effects);
+                        return Ok(());
                     }
                 }
                 analysis.add_reference(
@@ -1992,7 +1997,7 @@ async fn handle_call(
                     .to_resolved()
                     .await?,
                 );
-                return Ok(effects);
+                return Ok(());
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -2020,7 +2025,7 @@ async fn handle_call(
                         ),
                     );
                     // Always ignore this dynamic request
-                    return Ok(effects);
+                    return Ok(());
                 }
                 analysis.add_reference(
                     NodePreGypConfigReference::new(
@@ -2031,7 +2036,7 @@ async fn handle_call(
                     .to_resolved()
                     .await?,
                 );
-                return Ok(effects);
+                return Ok(());
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -2067,7 +2072,7 @@ async fn handle_call(
                         .to_resolved()
                         .await?,
                     );
-                    return Ok(effects);
+                    return Ok(());
                 }
             }
             let (args, hints) = explain_args(&args);
@@ -2095,7 +2100,7 @@ async fn handle_call(
                             .to_resolved()
                             .await?,
                     );
-                    return Ok(effects);
+                    return Ok(());
                 }
             }
             let (args, hints) = explain_args(&args);
@@ -2123,7 +2128,7 @@ async fn handle_call(
                             ),
                         );
                         // Always ignore this dynamic request
-                        return Ok(effects);
+                        return Ok(());
                     }
                     match s {
                         "views" => {
@@ -2152,7 +2157,7 @@ async fn handle_call(
                                         .to_resolved()
                                         .await?,
                                 );
-                                return Ok(effects);
+                                return Ok(());
                             }
                         }
                         "view engine" => {
@@ -2170,7 +2175,7 @@ async fn handle_call(
                                         .await?,
                                     );
                                 }
-                                return Ok(effects);
+                                return Ok(());
                             }
                         }
                         _ => {}
@@ -2214,7 +2219,7 @@ async fn handle_call(
                         .to_resolved()
                         .await?,
                 );
-                return Ok(effects);
+                return Ok(());
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -2241,7 +2246,7 @@ async fn handle_call(
                     .to_resolved()
                     .await?,
                 );
-                return Ok(effects);
+                return Ok(());
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -2282,7 +2287,7 @@ async fn handle_call(
                         analysis.add_reference(resolved_dir_ref);
                     }
 
-                    return Ok(effects);
+                    return Ok(());
                 }
             }
             let (args, hints) = explain_args(&args);
@@ -2300,12 +2305,12 @@ async fn handle_call(
         _ => {
             for arg in args {
                 if let EffectArg::Closure(_, block) = arg {
-                    effects.extend(block.effects);
+                    add_effects(block.effects);
                 }
             }
         }
     }
-    Ok(effects)
+    Ok(())
 }
 
 async fn handle_member(
